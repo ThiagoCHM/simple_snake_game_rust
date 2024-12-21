@@ -1,3 +1,3 @@
 # simple_snake_game_rust
 
-First trial
+Second Trial
