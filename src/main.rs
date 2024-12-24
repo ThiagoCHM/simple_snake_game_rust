@@ -1,11 +1,17 @@
-extern crate piston_window;
-extern crate rand;
-
 use piston_window::*;
-use rand::Rng;
-use std::time::{Duration, Instant};
+use rand::{thread_rng, Rng};
+use rodio::{Decoder, OutputStream, Sink};
+use std::collections::LinkedList;
+use std::fs::File;
+use std::io::BufReader;
+use std::iter::FromIterator;
 
-#[derive(Clone, Copy, PartialEq)]
+const WINDOW_SIZE: [u32; 2] = [640, 480];
+const GRID_SIZE: f64 = 20.0;
+const INITIAL_SPEED: f64 = 0.1;
+const JUMP_KEY: Key = Key::Space;
+
+#[derive(Copy, Clone, PartialEq, Debug)]
 enum Direction {
     Up,
     Down,
@@ -13,114 +19,229 @@ enum Direction {
     Right,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-struct Position {
-    x: i32,
-    y: i32,
+#[derive(Debug, Clone)]
+struct Snake {
+    body: LinkedList<[i32; 2]>,
+    direction: Direction,
+    has_jumped: bool,
+}
+
+impl Snake {
+    fn move_forward(&mut self) {
+        let head = *self.body.front().expect("Snake has no body");
+        let new_head = match self.direction {
+            Direction::Up => [head[0], head[1] - 1],
+            Direction::Down => [head[0], head[1] + 1],
+            Direction::Left => [head[0] - 1, head[1]],
+            Direction::Right => [head[0] + 1, head[1]],
+        };
+
+        if !self.has_jumped {
+            self.body.pop_back();
+        }
+        self.body.push_front(new_head);
+        self.has_jumped = false;
+    }
+
+    fn grow(&mut self) {
+        let tail = *self.body.back().expect("Snake has no tail");
+        self.body.push_back(tail);
+    }
+
+    fn change_direction(&mut self, new_direction: Direction) {
+        if self.direction != new_direction
+            && (self.direction == Direction::Left && new_direction != Direction::Right
+                || self.direction == Direction::Right && new_direction != Direction::Left
+                || self.direction == Direction::Up && new_direction != Direction::Down
+                || self.direction == Direction::Down && new_direction != Direction::Up)
+        {
+            self.direction = new_direction;
+        }
+    }
+
+    fn collides_with_self(&self) -> bool {
+        let head = self.body.front().unwrap();
+        self.body.iter().skip(1).any(|&segment| segment == *head)
+    }
+
+    fn collides_with_wall(&self) -> bool {
+        let head = self.body.front().unwrap();
+        head[0] < 0
+            || head[1] < 0
+            || head[0] >= (WINDOW_SIZE[0] as i32 / GRID_SIZE as i32)
+            || head[1] >= (WINDOW_SIZE[1] as i32 / GRID_SIZE as i32)
+    }
+}
+
+struct Game {
+    snake: Snake,
+    food: [i32; 2],
+    score: u32,
+    speed: f64,
+    game_over: bool,
+}
+
+impl Game {
+    fn new() -> Game {
+        Game {
+            snake: Snake {
+                body: LinkedList::from_iter(vec![[5, 5], [5, 6], [5, 7]].into_iter()),
+                direction: Direction::Right,
+                has_jumped: false,
+            },
+            food: Game::generate_food(),
+            score: 0,
+            speed: INITIAL_SPEED,
+            game_over: false,
+        }
+    }
+
+    fn generate_food(&self) -> [i32; 2] {
+        let mut rng = thread_rng();
+        loop {
+            let new_food = [
+                rng.gen_range(0..(WINDOW_SIZE[0] as i32 / GRID_SIZE as i32)),
+                rng.gen_range(0..(WINDOW_SIZE[1] as i32 / GRID_SIZE as i32)),
+            ];
+            if !self.snake.body.contains(&new_food) {
+                return new_food;
+            }
+        }
+    }
+
+    fn update(&mut self) {
+        if self.game_over {
+            return;
+        }
+
+        self.snake.move_forward();
+
+        if self.snake.collides_with_wall() || self.snake.collides_with_self() {
+            self.game_over = true;
+            play_sound("assets/audio/game_over.wav");
+            return;
+        }
+
+        if self.snake.body.front() == Some(&self.food) {
+            self.snake.grow();
+            self.food = self.generate_food();
+            self.score += 100;
+            play_sound("assets/audio/eat.wav");
+            if self.score % 1000 == 0 {
+                self.speed += 0.02;
+            }
+        }
+    }
+
+    fn draw(&self, context: &Context, graphics: &mut G2d, glyphs: &mut Glyphs) {
+        clear([0.0, 0.0, 0.0, 1.0], graphics);
+
+        for block in &self.snake.body {
+            rectangle(
+                [0.0, 1.0, 0.0, 1.0], // green
+                [
+                    block[0] as f64 * GRID_SIZE,
+                    block[1] as f64 * GRID_SIZE,
+                    GRID_SIZE,
+                    GRID_SIZE,
+                ],
+                context.transform,
+                graphics,
+            );
+        }
+
+        rectangle(
+            [1.0, 0.0, 0.0, 1.0], // red
+            [
+                self.food[0] as f64 * GRID_SIZE,
+                self.food[1] as f64 * GRID_SIZE,
+                GRID_SIZE,
+                GRID_SIZE,
+            ],
+            context.transform,
+            graphics,
+        );
+
+        let text_color = if self.game_over {
+            [1.0, 0.0, 0.0, 1.0]
+        } else {
+            [1.0, 1.0, 1.0, 1.0]
+        };
+        let text_position = if self.game_over {
+            (10.0, 100.0)
+        } else {
+            (10.0, 30.0)
+        };
+        let game_over_text = if self.game_over {
+            format!("Game Over - Score: {}", self.score)
+        } else {
+            format!("Score: {}", self.score)
+        };
+
+        text::Text::new_color(text_color, 32)
+            .draw(
+                &game_over_text,
+                glyphs,
+                &context.draw_state,
+                context.transform.trans(text_position.0, text_position.1),
+                graphics,
+            )
+            .unwrap();
+    }
+}
+
+fn play_sound(file_path: &str) {
+    let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+    let sink = Sink::try_new(&stream_handle).unwrap();
+
+    let file = File::open(file_path).expect("Failed to open audio file");
+    let source = Decoder::new(BufReader::new(file)).unwrap();
+    sink.append(source);
+    sink.sleep_until_end();
 }
 
 fn main() {
-    // Inicializa a janela
-    let mut window: PistonWindow = WindowSettings::new("Snake Game", [640, 480])
+    let mut window: PistonWindow = WindowSettings::new("Snake Game", WINDOW_SIZE)
         .exit_on_esc(true)
         .build()
         .unwrap();
 
-    let mut snake: Vec<Position> = vec![
-        Position { x: 5, y: 5 }, // A cabeça da cobra
-        Position { x: 4, y: 5 },
-        Position { x: 3, y: 5 },
-    ];
+    let mut game = Game::new();
+    let assets = find_folder::Search::ParentsThenKids(3, 3)
+        .for_folder("assets")
+        .expect("Failed to find 'assets' directory");
+    let font = assets.join("FiraSans-Regular.ttf");
+    let mut glyphs = Glyphs::new(
+        &font,
+        window.create_texture_context(),
+        TextureSettings::new(),
+    )
+    .expect("Failed to load font");
 
-    let mut direction = Direction::Right;
-    let mut food_position = generate_food(640 / 16, 480 / 16); // Gera o alimento
+    let mut last_update_time = std::time::Instant::now();
 
-    let mut last_update = Instant::now();
-    let update_rate = Duration::from_millis(200); // Define a velocidade da cobra
-
-    while let Some(e) = window.next() {
-        // Verifica as teclas pressionadas
-        if let Some(Button::Keyboard(key)) = e.press_args() {
-            match key {
-                Key::Up if direction != Direction::Down => direction = Direction::Up,
-                Key::Down if direction != Direction::Up => direction = Direction::Down,
-                Key::Left if direction != Direction::Right => direction = Direction::Left,
-                Key::Right if direction != Direction::Left => direction = Direction::Right,
-                _ => {}
+    while let Some(event) = window.next() {
+        if let Some(Button::Keyboard(key)) = event.press_args() {
+            if !game.game_over {
+                match key {
+                    Key::Up => game.snake.change_direction(Direction::Up),
+                    Key::Down => game.snake.change_direction(Direction::Down),
+                    Key::Left => game.snake.change_direction(Direction::Left),
+                    Key::Right => game.snake.change_direction(Direction::Right),
+                    JUMP_KEY => game.snake.has_jumped = true,
+                    _ => {}
+                }
             }
         }
 
-        // Atualiza a posição da cobra
-        if last_update.elapsed() >= update_rate {
-            update_snake(&mut snake, &direction);
-            if check_collision(&snake) || check_wall_collision(&snake[0], 640 / 16, 480 / 16) {
-                break; // O jogo acabou
-            }
-
-            // Verifica se a cobra comeu o alimento
-            if snake[0] == food_position {
-                snake.push(Position { x: -1, y: -1 }); // Adiciona um segmento à cobra
-                food_position = generate_food(640 / 16, 480 / 16); // Gera um novo alimento
-            }
-
-            last_update = Instant::now();
-        }
-
-        // Desenha o fundo, a cobra e o alimento
-        window.draw_2d(&e, |c, g, _| {
-            clear([0.0, 0.0, 0.0, 1.0], g); // Limpa a tela com fundo preto
-
-            // Desenha a cobra
-            for segment in &snake {
-                draw_block(segment.x, segment.y, g, &c); // Passa a referência a `c`
-            }
-
-            // Desenha o alimento
-            draw_block(food_position.x, food_position.y, g, &c); // Passa a referência a `c`
+        window.draw_2d(&event, |c, g, device| {
+            game.draw(&c, g, &mut glyphs);
+            glyphs.factory.encoder.flush(device);
         });
+
+        if last_update_time.elapsed().as_secs_f64() > game.speed {
+            game.update();
+            last_update_time = std::time::Instant::now();
+        }
     }
-}
-
-// Atualiza a posição da cobra
-fn update_snake(snake: &mut Vec<Position>, direction: &Direction) {
-    let mut new_head = snake[0]; // Copia a cabeça da cobra
-    match direction {
-        Direction::Up => new_head.y -= 1,
-        Direction::Down => new_head.y += 1,
-        Direction::Left => new_head.x -= 1,
-        Direction::Right => new_head.x += 1,
-    }
-
-    snake.insert(0, new_head); // Adiciona a nova cabeça à cobra
-    snake.pop(); // Remove o último segmento (a cobra não cresce ainda)
-}
-
-// Desenha um bloco (segmento da cobra ou alimento)
-fn draw_block(x: i32, y: i32, g: &mut G2d, c: &Context) {
-    rectangle(
-        [0.0, 1.0, 0.0, 1.0], // Cor verde
-        [x as f64 * 16.0, y as f64 * 16.0, 16.0, 16.0],
-        c.transform,
-        g,
-    );
-}
-
-// Gera uma posição aleatória para o alimento
-fn generate_food(grid_width: i32, grid_height: i32) -> Position {
-    let mut rng = rand::thread_rng();
-    Position {
-        x: rng.gen_range(0..grid_width),
-        y: rng.gen_range(0..grid_height),
-    }
-}
-
-// Verifica se a cobra colidiu com o seu próprio corpo
-fn check_collision(snake: &[Position]) -> bool {
-    let head = snake[0];
-    snake.iter().skip(1).any(|&segment| segment == head)
-}
-
-// Verifica se a cobra colidiu com as paredes
-fn check_wall_collision(head: &Position, grid_width: i32, grid_height: i32) -> bool {
-    head.x < 0 || head.y < 0 || head.x >= grid_width || head.y >= grid_height
 }
